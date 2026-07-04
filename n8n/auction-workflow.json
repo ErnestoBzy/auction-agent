@@ -1,0 +1,533 @@
+{
+  "name": "Auction Agent",
+  "nodes": [
+    {
+      "id": "webhook-001",
+      "name": "Webhook Receive",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        460
+      ],
+      "parameters": {
+        "path": "auctions",
+        "httpMethod": "POST",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "code-normalize",
+      "name": "Normalize Body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        460
+      ],
+      "parameters": {
+        "jsCode": "const lots = $input.item.json.body?.lots || $input.item.json.lots || [];\nreturn [{ json: { lots } }];"
+      }
+    },
+    {
+      "id": "code-prefilter",
+      "name": "Pre-filter & Split",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        460
+      ],
+      "parameters": {
+        "jsCode": "const lots = $input.item.json.lots;\n\n// Sort: prioritize lots with a real estimate (not BuyNow)\n// Ratio: total_price / estimate — smaller is better\nconst sorted = [...lots].sort((a, b) => {\n  const getRatio = l => {\n    if (l.estimate > 0) return l.total_price / l.estimate;  // real estimate\n    return 0.99;  // no estimate -> sort neutrally\n  };\n  return getRatio(a) - getRatio(b);\n});\n\n// Send the top 15 to Perplexity + Claude\nconst top = sorted.slice(0, 15);\nconsole.log('Lots total:', lots.length, '| To Perplexity/Claude:', top.length);\n\nif (top.length === 0) return [];\nreturn top.map(lot => ({ json: lot }));"
+      }
+    },
+    {
+      "id": "code-perplexity-body",
+      "name": "Perplexity Body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d = $input.item.json;\n\nconst estInfo = d.estimate > 0\n  ? 'Auction estimate (expert appraisal): ' + d.estimate + '\\u20ac\\n'\n  : '';\nconst buyNowInfo = d.buy_now_eur > 0\n  ? 'BuyNow price (NOT a market value, usually inflated): ' + d.buy_now_eur + '\\u20ac\\n'\n  : '';\nconst shippingInfo = d.shipping_eur > 0 ? 'Shipping to destination: ' + d.shipping_eur + '\\u20ac\\n' : '';\n\nconst prompt =\n  'Determine the current market value from real comparable sales (eBay sold, auction houses, marketplace shops, last 2 years).\\n\\n' +\n  'Title: ' + d.title + '\\n' +\n  'Category: ' + d.category + '\\n' +\n  (d.description ? 'Description: ' + d.description + '\\n' : '') +\n  estInfo + buyNowInfo +\n  'Current bid: ' + d.current_price + '\\u20ac (total price incl. fees: ' + d.total_price + '\\u20ac)\\n' +\n  shippingInfo + '\\n' +\n  'Answer ONLY as JSON (no markdown):\\n' +\n  '{\"market_value_eur\": 150, \"comparison_link\": \"https://...\", \"market_info\": \"max 50 words: price comparisons with sources\"}\\n' +\n  'market_value_eur: 0 if no comparison found. comparison_link: direct link or null.';\n\nreturn {\n  json: {\n    ...d,\n    _body: {\n      model: 'sonar',\n      messages: [{ role: 'user', content: prompt }],\n      max_tokens: 200\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "http-perplexity",
+      "name": "Market Research",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        460
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.perplexity.ai/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_PERPLEXITY_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json._body }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2000
+            }
+          }
+        }
+      },
+      "notes": "🔑 Enter Perplexity API key"
+    },
+    {
+      "id": "code-perplexity-extract",
+      "name": "Extract Market Research",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const response = $input.item.json;\nconst lot = $('Perplexity Body').item.json;\n\nconst content = response.choices?.[0]?.message?.content || '{}';\nlet market = {};\ntry {\n  const cleaned = content.replace(/```json\\n?/g, '').replace(/```\\n?/g, '').trim();\n  const match = cleaned.match(/\\{[\\s\\S]*\\}/);\n  market = JSON.parse(match ? match[0] : cleaned);\n} catch(e) {\n  market = { market_value_eur: 0, comparison_link: null, market_info: '' };\n}\n\nconst marketValue = Number(market.market_value_eur) || 0;\nconst ratio = marketValue > 0 ? lot.total_price / marketValue : null;\nconst link = (typeof market.comparison_link === 'string' && market.comparison_link.startsWith('http'))\n  ? market.comparison_link : null;\n\nreturn {\n  json: {\n    ...lot,\n    market_value_eur: marketValue,\n    comparison_link: link,\n    deal_ratio: ratio,\n    market_info: String(market.market_info || '')\n  }\n};"
+      }
+    },
+    {
+      "id": "code-claude-body",
+      "name": "Claude Body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d = $input.item.json;\n\n// No market value -> request a minimal answer\nconst hasMarketValue = d.market_value_eur > 0;\n\nconst marketValueInfo = hasMarketValue\n  ? 'Market value per research: ' + d.market_value_eur + '\\u20ac' +\n    (d.comparison_link ? ' | source: ' + d.comparison_link : '') +\n    (d.market_info ? '\\n' + d.market_info : '')\n  : 'Market value: NOT DETERMINED — no comparison found';\n\nconst dealInfo = hasMarketValue\n  ? 'Deal: total price ' + d.total_price + '\\u20ac = ' + Math.round(d.deal_ratio * 100) + '% of market value'\n  : '';\n\nconst estInfo = d.estimate > 0 ? 'Auction estimate: ' + d.estimate + '\\u20ac\\n' : '';\nconst buyNowInfo = d.buy_now_eur > 0 ? 'BuyNow (inflated, not a reference): ' + d.buy_now_eur + '\\u20ac\\n' : '';\nconst shippingInfo = d.shipping_eur > 0 ? 'Shipping to destination: ' + d.shipping_eur + '\\u20ac\\n' : 'Shipping: unknown\\n';\n\nconst ratingScale = hasMarketValue\n  ? 'Rating scale (total price vs. market value):\\n' +\n    '- Once-in-a-century: <10% | Sensational: 10-20% | Exceptional deal: 20-35%\\n' +\n    '- Very good bargain: 35-50% | Good bargain: 50-65%\\n' +\n    '- Offer: 65-80% | Solid offer: 80-105% | No bargain: >105%'\n  : 'No market value known -> rate as \"No bargain\" or \"Solid offer\" based on estimate/description.';\n\nconst tokenHint = hasMarketValue\n  ? 'Reasoning: max 60 words. Risks: max 25 words.'\n  : 'No market value -> rating: short (max 20 words), reasoning: max 30 words, risks: empty.';\n\nconst prompt =\n  'Rate this auction lot.\\n\\n' +\n  'Title: ' + d.title + '\\n' +\n  'Category: ' + d.category + '\\n' +\n  'Description: ' + d.description + '\\n' +\n  'Bid: ' + d.current_price + '\\u20ac + fee ' + d.platform_fee + '\\u20ac = total ' + d.total_price + '\\u20ac\\n' +\n  shippingInfo + estInfo + buyNowInfo +\n  marketValueInfo + '\\n' + dealInfo + '\\n' +\n  'Time left: ' + d.time_left_h + 'h\\n\\n' +\n  ratingScale + '\\n' + tokenHint + '\\n\\n' +\n  'Answer ONLY as JSON without markdown:\\n' +\n  '{\"rating\":\"...\",\"reasoning\":\"...\",\"risks\":\"...\"}';\n\nreturn {\n  json: {\n    auction_id: d.auction_id,\n    title: d.title,\n    description: d.description,\n    category: d.category,\n    current_price: d.current_price,\n    estimate: d.estimate,\n    buy_now_eur: d.buy_now_eur || 0,\n    market_value_eur: d.market_value_eur,\n    comparison_link: d.comparison_link,\n    market_info: d.market_info,\n    platform_fee: d.platform_fee,\n    total_price: d.total_price,\n    shipping_eur: d.shipping_eur || 0,\n    deal_ratio: d.deal_ratio,\n    time_left_h: d.time_left_h,\n    closes_at: d.closes_at || null,\n    link: d.link,\n    _body: {\n      model: 'claude-haiku-4-5-20251001',\n      max_tokens: hasMarketValue ? 450 : 200,\n      messages: [{ role: 'user', content: prompt }]\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "http-claude",
+      "name": "AI Rating",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        460
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "YOUR_CLAUDE_KEY"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json._body }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 3000
+            }
+          }
+        }
+      },
+      "notes": "🔑 Enter Claude API key"
+    },
+    {
+      "id": "code-claude-extract",
+      "name": "Extract Rating",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const response = $input.item.json;\nconst lot = $('Claude Body').item.json;\n\nconst content = response.content?.[0]?.text || '{}';\nlet rating = {};\ntry {\n  const cleaned = content.replace(/```json\\n?/g, '').replace(/```\\n?/g, '').trim();\n  rating = JSON.parse(cleaned);\n} catch(e) {\n  rating = {\n    rating: 'Solid offer',\n    reasoning: 'Automatic rating not possible.',\n    risks: 'Manual review recommended.'\n  };\n}\n\nconst ratingMap = {\n  'Once-in-a-century': '\\ud83d\\udc8e Once-in-a-century',\n  'Sensational': '\\ud83d\\udd25\\ud83d\\udd25 Sensational',\n  'Exceptional deal': '\\ud83d\\udd25 Exceptional deal',\n  'Very good bargain': '\\u2b50\\u2b50\\u2b50 Very good bargain',\n  'Good bargain': '\\u2b50\\u2b50 Good bargain',\n  'Offer': '\\u2b50 Offer',\n  'Solid offer': '\\u2705 Solid offer',\n  'No bargain': '\\u274c No bargain'\n};\n\nconst marketText = lot.market_value_eur > 0\n  ? 'Market value: ' + lot.market_value_eur + '\\u20ac | Deal: ' + Math.round((lot.deal_ratio || 0) * 100) + '% of market value' +\n    (lot.market_info ? '\\n' + lot.market_info : '') +\n    (lot.comparison_link ? '\\nComparison: ' + lot.comparison_link : '')\n  : 'No market value determined.' + (lot.market_info ? '\\n' + lot.market_info : '');\n\nreturn {\n  json: {\n    auction_id: lot.auction_id,\n    title: lot.title,\n    description: lot.description,\n    category: lot.category,\n    current_price: lot.current_price,\n    estimate: lot.estimate,\n    market_value_eur: lot.market_value_eur,\n    platform_fee: lot.platform_fee,\n    total_price: lot.total_price,\n    shipping_eur: lot.shipping_eur || 0,\n    time_left_h: lot.time_left_h,\n    closes_at: lot.closes_at || null,\n    link: lot.link,\n    market_research: marketText,\n    rating_notion: ratingMap[rating.rating] || '\\u2705 Solid offer',\n    reasoning: String(rating.reasoning || 'No reasoning').substring(0, 2000),\n    risks: String(rating.risks || 'No risks identified').substring(0, 2000)\n  }\n};"
+      }
+    },
+    {
+      "id": "http-notion-search",
+      "name": "Notion Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        460
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.notion.com/v1/databases/' + $env.NOTION_DB_ID + '/query' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_NOTION_TOKEN"
+            },
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { filter: { property: 'Auction_ID', rich_text: { equals: $json.auction_id } } } }}",
+        "options": {}
+      },
+      "notes": "🔑 Enter Notion token"
+    },
+    {
+      "id": "code-notion-check",
+      "name": "Check Notion Page",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const notionResponse = $input.item.json;\nconst lot = $('Extract Rating').item.json;\n\nconst results = notionResponse.results || [];\nconst exists = results.length > 0;\nconst pageId = exists ? results[0].id : null;\n\nreturn {\n  json: {\n    ...lot,\n    notion_exists: exists,\n    notion_page_id: pageId\n  }\n};"
+      }
+    },
+    {
+      "id": "if-exists",
+      "name": "Exists in Notion?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        460
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-exists",
+              "leftValue": "={{ $json.notion_exists }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "code-notion-update-body",
+      "name": "Notion Update Body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d = $input.item.json;\nconst props = {\n  'Title': { title: [{ text: { content: d.title } }] },\n  'Current Price (\\u20ac)': { number: d.current_price },\n  'Platform Fee (\\u20ac)': { number: d.platform_fee },\n  'Total Price (\\u20ac)': { number: d.total_price },\n  'Estimate (\\u20ac)': { number: d.estimate || 0 },\n  'BuyNow (\\u20ac)': { number: d.buy_now_eur || 0 },\n  'Market Value (\\u20ac)': { number: d.market_value_eur || 0 },\n  'Shipping (\\u20ac)': { number: d.shipping_eur || 0 },\n  'Rating': { select: { name: d.rating_notion } },\n  'Reasoning': { rich_text: [{ text: { content: d.reasoning } }] },\n  'Risks': { rich_text: [{ text: { content: d.risks } }] },\n  'Market Comparison': { rich_text: [{ text: { content: d.market_research } }] },\n  'Link': { url: d.link }\n};\nif (d.closes_at) props['Closes at'] = { date: { start: d.closes_at } };\nreturn {\n  json: {\n    notion_page_id: d.notion_page_id,\n    _body: { properties: props }\n  }\n};"
+      }
+    },
+    {
+      "id": "http-notion-update",
+      "name": "Notion Update",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        300
+      ],
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.notion.com/v1/pages/{{ $json.notion_page_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_NOTION_TOKEN"
+            },
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json._body }}",
+        "options": {}
+      },
+      "notes": "🔑 Enter Notion token"
+    },
+    {
+      "id": "code-notion-create-body",
+      "name": "Notion Create Body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        620
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const d = $input.item.json;\nconst props = {\n  'Title': { title: [{ text: { content: d.title } }] },\n  'Auction_ID': { rich_text: [{ text: { content: d.auction_id } }] },\n  'Category': { select: { name: d.category } },\n  'Current Price (\\u20ac)': { number: d.current_price },\n  'Platform Fee (\\u20ac)': { number: d.platform_fee },\n  'Total Price (\\u20ac)': { number: d.total_price },\n  'Estimate (\\u20ac)': { number: d.estimate || 0 },\n  'BuyNow (\\u20ac)': { number: d.buy_now_eur || 0 },\n  'Market Value (\\u20ac)': { number: d.market_value_eur || 0 },\n  'Shipping (\\u20ac)': { number: d.shipping_eur || 0 },\n  'Rating': { select: { name: d.rating_notion } },\n  'Reasoning': { rich_text: [{ text: { content: d.reasoning } }] },\n  'Risks': { rich_text: [{ text: { content: d.risks } }] },\n  'Market Comparison': { rich_text: [{ text: { content: d.market_research } }] },\n  'Link': { url: d.link }\n};\nif (d.closes_at) props['Closes at'] = { date: { start: d.closes_at } };\nreturn {\n  json: {\n    _body: {\n      parent: { database_id: $env.NOTION_DB_ID },\n      properties: props\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "http-notion-create",
+      "name": "Notion Create",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        620
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/pages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_NOTION_TOKEN"
+            },
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json._body }}",
+        "options": {}
+      },
+      "notes": "🔑 Enter Notion token"
+    }
+  ],
+  "connections": {
+    "Webhook Receive": {
+      "main": [
+        [
+          {
+            "node": "Normalize Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Body": {
+      "main": [
+        [
+          {
+            "node": "Pre-filter & Split",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-filter & Split": {
+      "main": [
+        [
+          {
+            "node": "Perplexity Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Perplexity Body": {
+      "main": [
+        [
+          {
+            "node": "Market Research",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Market Research": {
+      "main": [
+        [
+          {
+            "node": "Extract Market Research",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Market Research": {
+      "main": [
+        [
+          {
+            "node": "Claude Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Body": {
+      "main": [
+        [
+          {
+            "node": "AI Rating",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Rating": {
+      "main": [
+        [
+          {
+            "node": "Extract Rating",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Rating": {
+      "main": [
+        [
+          {
+            "node": "Notion Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion Search": {
+      "main": [
+        [
+          {
+            "node": "Check Notion Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Notion Page": {
+      "main": [
+        [
+          {
+            "node": "Exists in Notion?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Exists in Notion?": {
+      "main": [
+        [
+          {
+            "node": "Notion Update Body",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notion Create Body",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion Update Body": {
+      "main": [
+        [
+          {
+            "node": "Notion Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion Create Body": {
+      "main": [
+        [
+          {
+            "node": "Notion Create",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
