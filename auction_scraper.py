@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Copyright 2026 ErnestoBzy
 """
 Auction agent (Playwright version).
 Runs a real Chromium instance → bypasses the Akamai Bot Manager.

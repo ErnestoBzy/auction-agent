@@ -197,7 +197,8 @@ auction-agent/
 ├── requirements.txt            Python dependencies
 ├── COMMANDS.md                 this file
 ├── README.md                   full project documentation
-└── CONFIG.md                   central documentation of all {{...}} placeholders
+├── CONFIG.md                   central documentation of all {{...}} placeholders
+└── LICENSE.md                  PolyForm Noncommercial 1.0.0
 ```
 
 ---

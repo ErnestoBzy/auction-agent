@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Copyright 2026 ErnestoBzy
 """Re-verifies existing Notion entries with the pipeline's current verification code.
 
 Finds candidates:

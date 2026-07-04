@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Copyright 2026 ErnestoBzy
 """One-off analysis of the sales history DB.
 
 Pulls all entries from the Notion sales history DB and answers:

@@ -123,7 +123,8 @@ auction-agent/
 ├── requirements.txt            Python dependencies
 ├── .gitignore                  excludes .env, cache, __pycache__
 ├── COMMANDS.md                 all commands, cost reference
-└── CONFIG.md                   central documentation of all {{...}} placeholders
+├── CONFIG.md                   central documentation of all {{...}} placeholders
+└── LICENSE.md                  PolyForm Noncommercial 1.0.0
 ```
 
 ---
@@ -438,3 +439,9 @@ for now.
 | Rolex | {{CATEGORY_URL_ROLEX}} |
 
 Insert the platform's real category URLs — placeholders are documented in [CONFIG.md](CONFIG.md).
+
+---
+
+## License
+
+Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You may use, modify, and share this project for any **noncommercial** purpose — including viewing, learning, research, and personal use. **Commercial use is not permitted.** Copyright 2026 ErnestoBzy.
